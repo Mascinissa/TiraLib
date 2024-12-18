@@ -1,5 +1,5 @@
 import re
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Set
 
 from tiralib.tiramisu.tiramisu_iterator_node import (
     IteratorIdentifier,
@@ -396,6 +396,24 @@ class TiramisuTree:
     def set_iterator_ids(self) -> None:
         for iterator in self.iterators.values():
             iterator.id = self.get_iterator_id_from_name(iterator.name)
+
+    def get_alternative_iterator_identifers(self, iterator_name: str) -> Set[IteratorIdentifier]:
+        """
+        This function returns the set of valid iterator identifiers corresponding to iterator_name
+        """
+        iter_node = self.iterators[iterator_name]
+        subtree_comps = self.get_iterator_subtree_computations(iterator_name)
+        ids_set = {(comp, iter_node.level) for comp in subtree_comps}
+        return ids_set
+
+    def get_iterator_name_from_id(self, iter_id: IteratorIdentifier) -> str:
+        for iterator_name in self.iterators:
+            if iter_id in self.get_alternative_iterator_identifers(iterator_name):
+                return iterator_name
+        raise ValueError(f"Iterator with ID {iter_id} cannot be found.")
+
+    def get_iterator_node_from_id(self, iter_id: IteratorIdentifier) -> IteratorNode:
+        return self.iterators[self.get_iterator_name_from_id(iter_id)]
 
     def __repr__(self) -> str:
         representation = ""
