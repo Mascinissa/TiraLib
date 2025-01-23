@@ -40,7 +40,7 @@ class CompilingService:
 
         output_path = os.path.join(
             BaseConfig.base_config.workspace,
-            f"{schedule.tiramisu_program.name}_legality",
+            f"{schedule.tiramisu_program.temp_files_identifier}_legality",
         )
 
         cpp_code = cls.get_legality_code(schedule=schedule, with_ast=with_ast)
@@ -129,7 +129,7 @@ class CompilingService:
 
         output_path = os.path.join(
             BaseConfig.base_config.workspace,
-            f"{tiramisu_program.name}_annotations",
+            f"{tiramisu_program.temp_files_identifier}_annotations",
         )
         # Add code to the original file to get json annotations
 
@@ -167,7 +167,7 @@ class CompilingService:
 
         output_path = os.path.join(
             BaseConfig.base_config.workspace,
-            f"{tiramisu_program.name}_isl_ast",
+            f"{tiramisu_program.temp_files_identifier}_isl_ast",
         )
         get_isl_ast_lines = ""
         if schedule:
@@ -323,7 +323,7 @@ class CompilingService:
         logger.debug("Skewing Solver Code:\n" + solver_code)
         output_path = os.path.join(
             BaseConfig.base_config.workspace,
-            f"{schedule.tiramisu_program.name}_skewing_solver",
+            f"{schedule.tiramisu_program.temp_files_identifier}_skewing_solver",
         )
 
         result_str = cls.run_cpp_code(cpp_code=solver_code, output_path=output_path)
@@ -443,7 +443,7 @@ class CompilingService:
         cpp_code = cls.get_schedule_code(tiramisu_program, optims_list)
         # Write the code to a file
         output_path = os.path.join(
-            BaseConfig.base_config.workspace, tiramisu_program.name
+            BaseConfig.base_config.workspace, tiramisu_program.temp_files_identifier
         )
 
         cls.write_to_disk(cpp_code, output_path + "_schedule")
@@ -473,17 +473,17 @@ class CompilingService:
         shell_script = [
             # Compile intermidiate tiramisu file
             f"cd {BaseConfig.base_config.workspace}",
-            f"$CXX -Wl,--no-as-needed -ldl -g -fno-rtti -lpthread -fopenmp -std=c++17 -O0 -o {tiramisu_program.name}.o -c {tiramisu_program.name}_schedule.cpp",
+            f"$CXX -Wl,--no-as-needed -ldl -g -fno-rtti -lpthread -fopenmp -std=c++17 -O0 -o {tiramisu_program.temp_files_identifier}.o -c {tiramisu_program.temp_files_identifier}_schedule.cpp",
             # Link generated file with executer
-            f"$CXX -Wl,--no-as-needed -ldl -g -fno-rtti -lpthread -fopenmp -std=c++17 -O0 {tiramisu_program.name}.o -o {tiramisu_program.name}.out -ltiramisu -ltiramisu_auto_scheduler -lHalide -lisl",
+            f"$CXX -Wl,--no-as-needed -ldl -g -fno-rtti -lpthread -fopenmp -std=c++17 -O0 {tiramisu_program.temp_files_identifier}.o -o {tiramisu_program.temp_files_identifier}.out -ltiramisu -ltiramisu_auto_scheduler -lHalide -lisl",
             # Run the program
-            f"./{tiramisu_program.name}.out",
-            f"$CXX -shared -o {tiramisu_program.name}.so {tiramisu_program.name}.o",  # noqa: E501
+            f"./{tiramisu_program.temp_files_identifier}.out",
+            f"$CXX -shared -o {tiramisu_program.temp_files_identifier}.so {tiramisu_program.temp_files_identifier}.o",  # noqa: E501
         ]
         if not tiramisu_program.wrapper_obj:
             shell_script += [
                 # compile the wrapper
-                f"$CXX -std=c++17 -fno-rtti -o {tiramisu_program.name}_wrapper -ltiramisu -lHalide -ldl -lpthread -fopenmp -lm {tiramisu_program.name}_wrapper.cpp ./{tiramisu_program.name}.so -ltiramisu -lHalide -ldl -lpthread -fopenmp -lm -lisl"
+                f"$CXX -std=c++17 -fno-rtti -o {tiramisu_program.temp_files_identifier}_wrapper -ltiramisu -lHalide -ldl -lpthread -fopenmp -lm {tiramisu_program.temp_files_identifier}_wrapper.cpp ./{tiramisu_program.temp_files_identifier}.so -ltiramisu -lHalide -ldl -lpthread -fopenmp -lm -lisl"
             ]
         try:
             # run the compilation of the generator and wrapper
@@ -531,7 +531,7 @@ class CompilingService:
                 consumed_time = sum(results)
                 if consumed_time >= time_budget:
                     logger.debug(
-                        f"No time budget left to perform extra runs. Consumed time:{consumed_time} >= time budget:{time_budget}. Completed {len(results)} out of {min_runs} min_runs and 0 out of {max_runs-min_runs if max_runs else 'inf'} extra runs."
+                        f"No time budget left to perform extra runs. Consumed time:{consumed_time} >= time budget:{time_budget}. Completed {len(results)} out of {min_runs} min_runs and 0 out of {max_runs - min_runs if max_runs else 'inf'} extra runs."
                     )
                 # if a time_budget is set and hasn't been consumed by the min_runs
                 else:
@@ -557,11 +557,6 @@ class CompilingService:
                         shell=True,
                         check=False,
                     )
-
-                    if delete_files:
-                        CompilingService.delete_temporary_files(
-                            tiramisu_program=tiramisu_program
-                        )
 
                     # if the command has to quit properly, that is either on timeout or (noraml completion and non-empty stdout)
                     if not (
@@ -589,7 +584,10 @@ class CompilingService:
                                 f"Execution of wrapper timed-out. Completed {len(results)} out of {min_runs} min_runs and {len(compiler.stdout.split())} out of {nb_exec_left} extra runs. Collected measurements are [{' '.join(list(map(str, results)))}]+[{compiler.stdout}]."
                             )
                         results += [float(x) for x in compiler.stdout.split()]
-
+            if delete_files:
+                CompilingService.delete_temporary_files(
+                    tiramisu_program=tiramisu_program
+                )
             return results
 
         except subprocess.CalledProcessError as e:
@@ -619,9 +617,9 @@ class CompilingService:
             #  set the env variables
             f"export NB_EXEC={nb_exec}",
             # run the wrapper
-            f"./{tiramisu_program.name}_wrapper"
+            f"./{tiramisu_program.temp_files_identifier}_wrapper"
             if timeout is None
-            else f"timeout {timeout/1000} ./{tiramisu_program.name}_wrapper",
+            else f"timeout {timeout / 1000} ./{tiramisu_program.temp_files_identifier}_wrapper",
         ]
 
     @classmethod
@@ -630,7 +628,7 @@ class CompilingService:
         subprocess.run(
             [
                 # cd to the workspace and clean generated files
-                f"cd {BaseConfig.base_config.workspace} && rm {tiramisu_program.name}*"
+                f"cd {BaseConfig.base_config.workspace} && rm {tiramisu_program.temp_files_identifier}*"
             ],
             capture_output=True,
             text=True,
