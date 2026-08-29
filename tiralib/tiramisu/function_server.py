@@ -1,8 +1,10 @@
+import itertools
 import json
 import logging
 import os
 import re
 import subprocess
+import threading
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal
 
@@ -57,6 +59,10 @@ def build_env() -> dict:
     return env
 
 
+# Bumped whenever the generated server code changes shape; binaries report it
+# via `./<name>_server template_version` so reuse_server can detect stale ones.
+SERVER_TEMPLATE_VERSION = "tiralib-server-2"
+
 templateWithEverythinginUtils = """
 #include <tiramisu/tiramisu.h>
 #include <TiraLibCPP/actions.h>
@@ -71,6 +77,22 @@ int main(int argc, char *argv[])
     // get the operation to perform
     Operation operation = Operation::legality;
 
+    if (argc >= 2 && std::string(argv[1]) == "template_version")
+    {{
+        std::cout << "{template_version}" << std::endl;
+        return 0;
+    }}
+
+    std::string function_name = "{name}";
+
+    {body}
+
+    // persistent fork-server mode: one request per stdin line (see run_server_loop)
+    if (argc >= 2 && std::string(argv[1]) == "serve")
+    {{
+        return run_server_loop(function_name, {buffers});
+    }}
+
     if (argc >= 2)
     {{
         operation = get_operation_from_string(argv[1]);
@@ -80,14 +102,14 @@ int main(int argc, char *argv[])
     if (argc == 3)
         schedule_str = argv[2];
 
-    std::string function_name = "{name}";
-
-    {body}
-
     schedule_str_to_result_str(function_name, schedule_str, operation, {buffers});
     return 0;
 }}
 """  # noqa: E501
+
+SERVE_READY = "###TIRALIB_SERVE_READY###"
+SERVE_DONE = "###TIRALIB_SERVE_DONE###"
+SERVE_FAIL = "###TIRALIB_SERVE_FAIL"
 
 
 class ResultInterface:
@@ -139,6 +161,114 @@ class ResultInterface:
         return self.__str__()
 
 
+class ServeClient:
+    """Client for one persistent fork-server instance (`./<ident>_server serve`).
+
+    The server builds the tiramisu function and runs dependency analysis once;
+    each request is then handled by a forked child (fresh schedule state, crash
+    isolation) without re-paying process spawn, dylib load, function build or
+    dependency analysis. Requests on one instance are strictly serial (guarded
+    by a lock); use several instances for parallelism (e.g. concurrent legality
+    checks from a thread pool).
+    """
+
+    def __init__(
+        self,
+        server_binary: str,
+        workspace: str,
+        env: dict,
+        stderr_path: str | None = None,
+    ):
+        self.server_binary = server_binary
+        self.workspace = workspace
+        # serializes requests on this instance so several threads can share a
+        # pool of instances safely (one in-flight request per instance)
+        self.lock = threading.Lock()
+        self._stderr_f = open(stderr_path, "ab") if stderr_path else subprocess.DEVNULL
+        self.proc = subprocess.Popen(
+            [f"./{server_binary}", "serve"],
+            cwd=workspace,
+            env=env,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=self._stderr_f,
+        )
+        self._read_until(SERVE_READY)
+
+    def _read_until(self, sentinel: str) -> bytes:
+        collected = []
+        while True:
+            line = self.proc.stdout.readline()
+            if not line:
+                raise ServerExecutionFailedError(
+                    f"serve process {self.server_binary} died "
+                    f"(exit={self.proc.poll()})"
+                )
+            text = line.decode("utf-8", errors="replace").strip()
+            if text == sentinel:
+                return b"".join(collected)
+            if text.startswith(SERVE_FAIL):
+                raise ServerExecutionFailedError(
+                    f"serve child failed: {text} (partial output: "
+                    f"{b''.join(collected)[-300:]!r})"
+                )
+            collected.append(line)
+
+    def request(
+        self,
+        op: str,
+        schedule_str: str = "",
+        min_runs: int = 1,
+        max_runs: int | None = None,
+        time_budget: float | None = None,
+        obj_tag: str = "",
+    ) -> "ResultInterface":
+        if self.proc.poll() is not None:
+            raise ServerExecutionFailedError(
+                f"serve process {self.server_binary} is not running"
+            )
+        line = "\t".join(
+            [
+                op,
+                str(min_runs),
+                str(max_runs) if max_runs else "inf",
+                str(time_budget) if time_budget else "-1",
+                obj_tag,
+                schedule_str,
+            ]
+        )
+        with self.lock:
+            self.proc.stdin.write((line + "\n").encode("utf-8"))
+            self.proc.stdin.flush()
+            output = self._read_until(SERVE_DONE)
+        return ResultInterface(output)
+
+    def annotations(self) -> str:
+        if self.proc.poll() is not None:
+            raise ServerExecutionFailedError(
+                f"serve process {self.server_binary} is not running"
+            )
+        with self.lock:
+            self.proc.stdin.write(b"annotations\t1\tinf\t-1\t\t\n")
+            self.proc.stdin.flush()
+            return self._read_until(SERVE_DONE).decode("utf-8").strip()
+
+    def close(self):
+        try:
+            if self.proc.poll() is None:
+                self.proc.stdin.write(b"exit\n")
+                self.proc.stdin.flush()
+                self.proc.wait(timeout=5)
+        except Exception:
+            self.proc.kill()
+        finally:
+            if self._stderr_f is not subprocess.DEVNULL:
+                try:
+                    self._stderr_f.close()
+                except Exception:
+                    pass
+
+
 class FunctionServer:
     """Function server class."""
 
@@ -150,6 +280,8 @@ class FunctionServer:
             raise ValueError("Tiramisu program not initialized")
 
         self.tiramisu_program = tiramisu_program
+        self._serve_clients: list[ServeClient] = []
+        self._rr = itertools.count()
 
         server_path_cpp = (
             Path(BaseConfig.base_config.workspace)
@@ -162,8 +294,13 @@ class FunctionServer:
         )
 
         if reuse_server and server_path.exists():
-            logger.info("Server code already exists. Skipping generation")
-            return
+            if self._binary_template_version(server_path) == SERVER_TEMPLATE_VERSION:
+                logger.info("Server code already exists. Skipping generation")
+                return
+            logger.info(
+                "Existing server binary was generated from an older template; "
+                "regenerating"
+            )
 
         # Generate the server code
         server_code = FunctionServer._generate_server_code_from_program(
@@ -198,8 +335,50 @@ class FunctionServer:
             name=tiramisu_program.temp_files_identifier,
             body=tiramisu_program.body,
             buffers="{&" + ", &".join(tiramisu_program.IO_buffer_names) + "}",
+            template_version=SERVER_TEMPLATE_VERSION,
         )
         return function_str
+
+    @staticmethod
+    def _binary_template_version(server_path) -> str | None:
+        """Ask an existing server binary which template generated it. Binaries
+        from before the version handshake abort on the unknown argument and
+        report None, which callers treat as stale."""
+        try:
+            out = subprocess.check_output(
+                [str(server_path), "template_version"],
+                env=build_env(),
+                cwd=str(server_path.parent),
+                stderr=subprocess.DEVNULL,
+                timeout=30,
+            )
+            return out.decode("utf-8").strip()
+        except Exception:
+            return None
+
+    # ------------------------------------------------------------------
+    # Persistent serve mode
+    # ------------------------------------------------------------------
+    def start_serve(self, n_instances: int = 1, stderr_path: str | None = None):
+        """Start (or grow to) n_instances persistent serve processes."""
+        assert BaseConfig.base_config
+        env = build_env()
+        ws = str(BaseConfig.base_config.workspace)
+        name = f"{self.tiramisu_program.temp_files_identifier}_server"
+        while len(self._serve_clients) < n_instances:
+            self._serve_clients.append(
+                ServeClient(name, ws, env, stderr_path=stderr_path)
+            )
+        return self._serve_clients
+
+    @property
+    def serve_clients(self) -> list["ServeClient"]:
+        return self._serve_clients
+
+    def stop_serve(self):
+        for c in self._serve_clients:
+            c.close()
+        self._serve_clients = []
 
     @classmethod
     def _pch_stamp(cls, env: dict) -> str:
@@ -298,8 +477,9 @@ class FunctionServer:
         assert operation in [
             "execution",
             "legality",
+            "legality_noast",
         ], (
-            f"Invalid operation {operation}. Valid operations are: execution, legality, annotations"
+            f"Invalid operation {operation}. Valid operations are: execution, legality, legality_noast, annotations"
         )  # noqa: E501
 
         legality_result = None
@@ -328,10 +508,37 @@ class FunctionServer:
                     return legality_result
                 server_operation = "execution_no_check"
 
-        if operation == "legality" and schedule is not None:
+        if operation in ("legality", "legality_noast") and schedule is not None:
             schedule_str = schedule.get_legality_str()
         else:
             schedule_str = str(schedule or "")
+
+        # Serve mode: route through a persistent instance (no process spawn,
+        # no dylib reload, no function rebuild, no dependency re-analysis).
+        # Prefer an idle instance so threaded callers get real parallelism.
+        if self._serve_clients:
+            client = next(
+                (c for c in self._serve_clients if not c.lock.locked()),
+                self._serve_clients[next(self._rr) % len(self._serve_clients)],
+            )
+            result = client.request(
+                server_operation,
+                schedule_str=schedule_str,
+                min_runs=min_runs,
+                max_runs=max_runs,
+                time_budget=time_budget,
+            )
+            if delete_files:
+                self.delete_temporary_files()
+            if legality_result is not None:
+                result.legality = legality_result.legality
+            elif (
+                operation == "execution"
+                and schedule is not None
+                and schedule.legality is True
+            ):
+                result.legality = True
+            return result
 
         env = build_env()
         ws = BaseConfig.base_config.workspace
@@ -364,6 +571,8 @@ class FunctionServer:
         """Run the server code to get the annotations."""
         if not BaseConfig.base_config:
             raise ValueError("BaseConfig not initialized")
+        if self._serve_clients:
+            return self._serve_clients[0].annotations()
         env = build_env()
         ws = BaseConfig.base_config.workspace
         command = f"./{self.tiramisu_program.temp_files_identifier}_server annotations"

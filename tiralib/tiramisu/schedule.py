@@ -168,9 +168,15 @@ class Schedule:
             delete_files=delete_files,
         )
 
-    def is_legal(self, with_ast: bool = False) -> bool:
+    def is_legal(self, with_ast: bool = False, fast: bool = False) -> bool:
         """
         Checks if the schedule is legal.
+
+        With fast=True (opt-in), the server skips generating/serializing the ISL
+        AST (the most expensive part of a legality check after the dependence
+        test itself) and the schedule tree is NOT updated — use only when the
+        caller needs the boolean verdict alone (e.g. legality-filtering a
+        candidate list).
 
         Returns
         -------
@@ -179,6 +185,11 @@ class Schedule:
         if not self.optims_list:
             self.legality = True
             return True
+
+        if fast and self.tiramisu_program.server:
+            result = self.tiramisu_program.server.run("legality_noast", self)
+            self.legality = result.legality
+            return result.legality
 
         if self.tiramisu_program.server:
             result = self.tiramisu_program.server.run("legality", self)
