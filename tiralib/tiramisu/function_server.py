@@ -1,5 +1,6 @@
 import json
 import logging
+import os
 import re
 import subprocess
 from pathlib import Path
@@ -16,6 +17,27 @@ logger = logging.getLogger(__name__)
 
 class ServerExecutionFailedError(Exception):
     """Exception raised when the server execution fails."""
+
+
+def _expand(path_str: str) -> str:
+    return os.path.expandvars(path_str)
+
+
+def build_env() -> dict:
+    """The environment the server compile/run commands used to assemble via
+    `export` statements, as a dict usable with subprocess env=."""
+    if not BaseConfig.base_config:
+        raise ValueError("BaseConfig not initialized")
+    env = os.environ.copy()
+    for key, value in BaseConfig.base_config.env_vars.items():
+        env[key] = _expand(str(value))
+    libs = ":".join(_expand(p) for p in BaseConfig.base_config.dependencies.libs)
+    env["LD_LIBRARY_PATH"] = libs + ":" + env.get("LD_LIBRARY_PATH", "")
+    env["LIBRARY_PATH"] = libs + ":" + env.get("LIBRARY_PATH", "")
+    env["CPATH"] = ":".join(
+        _expand(p) for p in BaseConfig.base_config.dependencies.includes
+    )
+    return env
 
 
 templateWithEverythinginUtils = """
@@ -167,31 +189,29 @@ class FunctionServer:
         if not BaseConfig.base_config:
             raise ValueError("BaseConfig not initialized")
 
-        libs = ":".join(BaseConfig.base_config.dependencies.libs)
-        env_vars = " && ".join(
-            [
-                f"export {key}={value}"
-                for key, value in BaseConfig.base_config.env_vars.items()
-            ]
+        env = build_env()
+        ws = BaseConfig.base_config.workspace
+        name = self.tiramisu_program.temp_files_identifier
+
+        use_sqlite = "-lsqlite3" if BaseConfig.base_config.tiralib_cpp.use_sqlite else ""
+        compile_command = (
+            f"$CXX -fvisibility-inlines-hidden -ftree-vectorize -fstack-protector-strong "
+            f"-fno-plt -O3 -ffunction-sections -pipe -ldl -g -fno-rtti -lpthread -std=c++17 "
+            f"-MD -MT {name}.cpp.o -MF {name}.cpp.o.d -o {name}.cpp.o -c {name}_server.cpp && "
+            f"$CXX -fvisibility-inlines-hidden -ftree-vectorize -fstack-protector-strong "
+            f"-fno-plt -O3 -ffunction-sections -pipe -ldl -g -fno-rtti -lpthread "
+            f"{name}.cpp.o -o {name}_server "
+            f"-ltiramisu -ltiramisu_auto_scheduler -lHalide -lisl -lTiraLibCPP {use_sqlite} -lz"
         )
-
-        env_vars += f" && export LD_LIBRARY_PATH={libs}:$LD_LIBRARY_PATH"
-        env_vars += f" && export LIBRARY_PATH={libs}:$LIBRARY_PATH"
-        env_vars += (
-            f" && export CPATH={':'.join(BaseConfig.base_config.dependencies.includes)}"
-        )
-
-        libs = ":".join(BaseConfig.base_config.dependencies.libs)
-
-        compile_command = f"cd {BaseConfig.base_config.workspace} && {env_vars} && export FUNC_NAME={self.tiramisu_program.temp_files_identifier} && $CXX -fvisibility-inlines-hidden -ftree-vectorize  -fstack-protector-strong -fno-plt -O3 -ffunction-sections -pipe -ldl -g -fno-rtti -lpthread -std=c++17 -MD -MT ${{FUNC_NAME}}.cpp.o -MF ${{FUNC_NAME}}.cpp.o.d -o ${{FUNC_NAME}}.cpp.o -c ${{FUNC_NAME}}_server.cpp && $CXX -fvisibility-inlines-hidden -ftree-vectorize  -fstack-protector-strong -fno-plt -O3 -ffunction-sections -pipe -ldl -g -fno-rtti -lpthread ${{FUNC_NAME}}.cpp.o -o ${{FUNC_NAME}}_server -ltiramisu -ltiramisu_auto_scheduler -lHalide -lisl -lTiraLibCPP {'-lsqlite3' if BaseConfig.base_config.tiralib_cpp.use_sqlite else ''} -lz"  # noqa: E501
 
         # run the command and retrieve the execution status
         try:
-            subprocess.check_output(compile_command, shell=True)
+            subprocess.check_output(
+                compile_command, shell=True, cwd=ws, env=env, stderr=subprocess.STDOUT
+            )
         except subprocess.CalledProcessError as e:
             logger.error(f"Error while compiling server code: {e}")
             logger.error(e.output)
-            logger.error(e.stderr)
             raise e
 
     def run(
@@ -234,30 +254,23 @@ class FunctionServer:
                 return legality_result
             server_operation = "execution_no_check"
 
-        env_vars = " && ".join(
-            [
-                f"export {key}={value}"
-                for key, value in BaseConfig.base_config.env_vars.items()
-            ]
-        )
-
-        libs = ":".join(BaseConfig.base_config.dependencies.libs)
-        env_vars += f" && export LD_LIBRARY_PATH={libs}:$LD_LIBRARY_PATH"
-        env_vars += f" && export LIBRARY_PATH={libs}:$LIBRARY_PATH"
-        env_vars += (
-            f" && export CPATH={':'.join(BaseConfig.base_config.dependencies.includes)}"
-        )
-
         if operation == "legality" and schedule is not None:
             schedule_str = schedule.get_legality_str()
         else:
             schedule_str = str(schedule or "")
 
-        command = f'{env_vars} && cd {BaseConfig.base_config.workspace} && MIN_RUNS={min_runs} MAX_RUNS={max_runs if max_runs else "inf"} TIME_BUDGET={time_budget if time_budget else "-1"} ./{self.tiramisu_program.temp_files_identifier}_server {server_operation} "{schedule_str}"'  # noqa: E501
+        env = build_env()
+        ws = BaseConfig.base_config.workspace
+        command = (
+            f'MIN_RUNS={min_runs} MAX_RUNS={max_runs if max_runs else "inf"} '
+            f'TIME_BUDGET={time_budget if time_budget else "-1"} '
+            f'./{self.tiramisu_program.temp_files_identifier}_server '
+            f'{server_operation} "{schedule_str}"'
+        )
 
         # run the command and retrieve the execution status
         try:
-            output = subprocess.check_output(command, shell=True)
+            output = subprocess.check_output(command, shell=True, cwd=ws, env=env)
         except subprocess.CalledProcessError as e:
             logger.error(f"Error while running server code: {e}")
             logger.error(e.output)
@@ -274,24 +287,13 @@ class FunctionServer:
         """Run the server code to get the annotations."""
         if not BaseConfig.base_config:
             raise ValueError("BaseConfig not initialized")
-        env_vars = " && ".join(
-            [
-                f"export {key}={value}"
-                for key, value in BaseConfig.base_config.env_vars.items()
-            ]
-        )
-        libs = ":".join(BaseConfig.base_config.dependencies.libs)
-        env_vars += f" && export LD_LIBRARY_PATH={libs}:$LD_LIBRARY_PATH"
-        env_vars += f" && export LIBRARY_PATH={libs}:$LIBRARY_PATH"
-        env_vars += (
-            f" && export CPATH={':'.join(BaseConfig.base_config.dependencies.includes)}"
-        )
-
-        command = f"{env_vars} && cd {BaseConfig.base_config.workspace} && ./{self.tiramisu_program.temp_files_identifier}_server annotations"  # noqa: E501
+        env = build_env()
+        ws = BaseConfig.base_config.workspace
+        command = f"./{self.tiramisu_program.temp_files_identifier}_server annotations"
 
         # run the command and retrieve the execution status
         try:
-            output = subprocess.check_output(command, shell=True)
+            output = subprocess.check_output(command, shell=True, cwd=ws, env=env)
         except subprocess.CalledProcessError as e:
             logger.error(f"Error while running server code: {e}")
             logger.error(e.output)
