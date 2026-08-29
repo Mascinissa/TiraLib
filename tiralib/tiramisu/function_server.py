@@ -236,23 +236,28 @@ class FunctionServer:
         legality_result = None
         server_operation = operation
         if operation == "execution" and schedule is not None:
-            # Validate subset unrolling with the specialized full-loop check,
-            # then replay the exact serialized computation subset in a fresh
-            # server process.  Tiramisu's transformed-schedule legality path
-            # cannot represent subset unrolling directly.
-            legality_result = self.run(
-                operation="legality",
-                schedule=schedule,
-                min_runs=min_runs,
-                max_runs=max_runs,
-                time_budget=time_budget,
-                delete_files=False,
-            )
-            if not legality_result.legality:
-                if delete_files:
-                    self.delete_temporary_files()
-                return legality_result
-            server_operation = "execution_no_check"
+            # The execution replay serializes subset unrolling as plain U(...),
+            # which Tiramisu's transformed-schedule legality path cannot
+            # represent; legality must come from the UCheck serialization.
+            # When the schedule's legality is already known (an explicit
+            # is_legal() ran that exact check), re-running it here would be
+            # pure duplicated work — trust it and go straight to the replay.
+            if schedule.legality is True:
+                server_operation = "execution_no_check"
+            else:
+                legality_result = self.run(
+                    operation="legality",
+                    schedule=schedule,
+                    min_runs=min_runs,
+                    max_runs=max_runs,
+                    time_budget=time_budget,
+                    delete_files=False,
+                )
+                if not legality_result.legality:
+                    if delete_files:
+                        self.delete_temporary_files()
+                    return legality_result
+                server_operation = "execution_no_check"
 
         if operation == "legality" and schedule is not None:
             schedule_str = schedule.get_legality_str()
@@ -281,6 +286,9 @@ class FunctionServer:
         result = ResultInterface(output)
         if legality_result is not None:
             result.legality = legality_result.legality
+        elif operation == "execution" and schedule is not None and schedule.legality is True:
+            # execution_no_check trusted the caller's legality; reflect it back.
+            result.legality = True
         return result
 
     def get_annotations(self):
