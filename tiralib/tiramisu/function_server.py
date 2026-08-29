@@ -23,6 +23,23 @@ def _expand(path_str: str) -> str:
     return os.path.expandvars(path_str)
 
 
+# The server binary is pure glue (function construction + request dispatch); the
+# schedules it times run from Halide-generated objects whose compilation is
+# independent, so optimizing the glue wastes seconds per program. -O0/-g0 halves
+# the per-program server compile; the shared precompiled header (identical
+# includes for every program) removes most of the rest. Override with
+# TIRALIB_SERVER_CXXFLAGS if needed.
+SERVER_CXXFLAGS = os.environ.get(
+    "TIRALIB_SERVER_CXXFLAGS", "-O0 -g0 -fno-rtti -std=c++17 -pipe"
+)
+PCH_HEADER_NAME = "tiralib_pch.h"
+PCH_CONTENT = (
+    "#include <tiramisu/tiramisu.h>\n"
+    "#include <TiraLibCPP/actions.h>\n"
+    "#include <TiraLibCPP/utils.h>\n"
+)
+
+
 def build_env() -> dict:
     """The environment the server compile/run commands used to assemble via
     `export` statements, as a dict usable with subprocess env=."""
@@ -184,6 +201,58 @@ class FunctionServer:
         )
         return function_str
 
+    @classmethod
+    def _pch_stamp(cls, env: dict) -> str:
+        """Fingerprint of everything the precompiled header depends on: compiler,
+        flags, and the modification times of the directly-included headers
+        (resolved through CPATH). Rebuilding on any change keeps a stale .gch
+        from breaking or silently mismatching after a TiraLibCPP/tiramisu
+        update. (Deep-include edits inside tiramisu are not tracked; wipe the
+        workspace or touch a top-level header after those.)"""
+        try:
+            cxx_id = subprocess.check_output(
+                "$CXX --version", shell=True, env=env, text=True
+            ).splitlines()[0]
+        except Exception:
+            cxx_id = "unknown"
+        mtimes = []
+        for rel in ("tiramisu/tiramisu.h", "TiraLibCPP/actions.h", "TiraLibCPP/utils.h"):
+            for inc_dir in env.get("CPATH", "").split(":"):
+                cand = Path(inc_dir) / rel
+                if inc_dir and cand.exists():
+                    mtimes.append(f"{rel}:{cand.stat().st_mtime_ns}")
+                    break
+        return json.dumps({"cxx": cxx_id, "flags": SERVER_CXXFLAGS, "headers": mtimes})
+
+    @classmethod
+    def _ensure_pch(cls, env: dict) -> str | None:
+        """Build the shared precompiled header once per workspace (every server
+        .cpp shares the exact same includes), rebuilding when the compiler,
+        flags or headers changed. Returns the header name for -include, or
+        None if the PCH could not be built (compilation then proceeds without
+        it, just slower)."""
+        assert BaseConfig.base_config
+        ws = Path(BaseConfig.base_config.workspace)
+        pch_h = ws / PCH_HEADER_NAME
+        pch_gch = ws / (PCH_HEADER_NAME + ".gch")
+        stamp_file = ws / (PCH_HEADER_NAME + ".stamp")
+        stamp = cls._pch_stamp(env)
+        if pch_gch.exists() and stamp_file.exists() and stamp_file.read_text() == stamp:
+            return str(pch_h.name)
+        try:
+            pch_h.write_text(PCH_CONTENT)
+            cmd = f"$CXX {SERVER_CXXFLAGS} -x c++-header {pch_h.name} -o {pch_gch.name}"
+            subprocess.check_output(
+                cmd, shell=True, cwd=ws, env=env, stderr=subprocess.STDOUT
+            )
+            stamp_file.write_text(stamp)
+            return str(pch_h.name)
+        except subprocess.CalledProcessError as e:
+            logger.warning(f"PCH build failed (continuing without): {e.output}")
+            pch_gch.unlink(missing_ok=True)
+            stamp_file.unlink(missing_ok=True)
+            return None
+
     def _compile_server_code(self):
         """Compile the server code."""
         if not BaseConfig.base_config:
@@ -193,15 +262,15 @@ class FunctionServer:
         ws = BaseConfig.base_config.workspace
         name = self.tiramisu_program.temp_files_identifier
 
+        pch = FunctionServer._ensure_pch(env)
+        include_pch = f"-include {pch} " if pch else ""
+
         use_sqlite = "-lsqlite3" if BaseConfig.base_config.tiralib_cpp.use_sqlite else ""
         compile_command = (
-            f"$CXX -fvisibility-inlines-hidden -ftree-vectorize -fstack-protector-strong "
-            f"-fno-plt -O3 -ffunction-sections -pipe -ldl -g -fno-rtti -lpthread -std=c++17 "
-            f"-MD -MT {name}.cpp.o -MF {name}.cpp.o.d -o {name}.cpp.o -c {name}_server.cpp && "
-            f"$CXX -fvisibility-inlines-hidden -ftree-vectorize -fstack-protector-strong "
-            f"-fno-plt -O3 -ffunction-sections -pipe -ldl -g -fno-rtti -lpthread "
-            f"{name}.cpp.o -o {name}_server "
-            f"-ltiramisu -ltiramisu_auto_scheduler -lHalide -lisl -lTiraLibCPP {use_sqlite} -lz"
+            f"$CXX {SERVER_CXXFLAGS} {include_pch}-o {name}.cpp.o -c {name}_server.cpp && "
+            f"$CXX {SERVER_CXXFLAGS} {name}.cpp.o -o {name}_server "
+            f"-ldl -lpthread -ltiramisu -ltiramisu_auto_scheduler -lHalide -lisl "
+            f"-lTiraLibCPP {use_sqlite} -lz"
         )
 
         # run the command and retrieve the execution status
